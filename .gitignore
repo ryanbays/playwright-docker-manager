@@ -1,3 +1,6 @@
 /venv/
+.idea
+.vscode
 pyrightconfig.json
 hosts.json
+/__pycache__/

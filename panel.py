@@ -19,17 +19,20 @@ Multi-host:
   • The sidebar lists all hosts; clicking one makes it active.
   • Add / Remove host via the sidebar controls.
   • All API calls (upload, remove, logs, clear logs) go to the active host.
+
+Layout:
+  Left sidebar  – host list + add/remove controls
+  Right area    – active-host bar on top, then a TabbedContent whose tabs are:
+                    Auth State | Remove State | API Log | Worker Log | Activity
 """
 
 import asyncio
 import json
-import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 
 import httpx
@@ -37,7 +40,7 @@ from playwright.async_api import async_playwright
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import (
     Button,
@@ -76,51 +79,10 @@ def save_hosts(hosts: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Chromium helpers  (mirrors create-state.js)
-# ---------------------------------------------------------------------------
-
-def find_chromium_executable() -> str:
-    """Return the Chromium binary path that the installed playwright uses."""
-    # playwright Python exposes this via the registry
-    from playwright._impl._driver import compute_driver_executable
-    import subprocess as _sp
-
-    # Ask the playwright CLI which chromium it would use
-    result = _sp.run(
-        [sys.executable, "-m", "playwright", "run-driver"],
-        input=b'{"id":1,"method":"initialize","params":{"sdkLanguage":"python"}}\n',
-        capture_output=True,
-        timeout=5,
-    )
-    # Fallback: use playwright's own path resolution via Python API
-    # We resolve at runtime inside the async context instead.
-    return ""   # sentinel – resolved in create_state_for_host()
-
-
-async def _get_chromium_executable() -> str:
-    """Resolve the Playwright-managed Chromium executable path."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        executable = browser.process  # not directly exposed this way
-        await browser.close()
-    # Use the env-var path that playwright installs to
-    # playwright stores browsers under ~/.cache/ms-playwright  (Linux/Mac)
-    # or %LOCALAPPDATA%\ms-playwright  (Windows)
-    from playwright._impl._api_types import Error as PWError  # noqa
-    # Simplest reliable method: launch a context and ask Chromium to print its path
-    async with async_playwright() as p:
-        # executablePath() equivalent in Python
-        return p.chromium.executable_path
-
-
-# ---------------------------------------------------------------------------
 # Core three-step algorithm  (direct Python rewrite of create-state.js)
 # ---------------------------------------------------------------------------
 
-async def create_auth_state(
-    target_url: str,
-    log_fn,
-) -> Path:
+async def create_auth_state(target_url: str, log_fn) -> Path:
     """
     Full three-step flow:
       1. Raw Chromium (manual login) → wait for close
@@ -129,11 +91,11 @@ async def create_auth_state(
     Returns the path to the saved state JSON file.
     """
     profile_dir = Path(tempfile.mkdtemp(prefix="pw-profile-"))
-    state_file = Path(tempfile.mktemp(suffix="-auth-state.json"))
+    state_file  = Path(tempfile.mktemp(suffix="-auth-state.json"))
 
     log_fn(f"[step 1/3] Profile dir: {profile_dir}")
 
-    # ── Step 1: Manual Chromium session ─────────────────────────────────────
+    # ── Step 1: resolve executable then open manual Chromium ────────────────
     async with async_playwright() as p:
         executable = p.chromium.executable_path
         log_fn(f"[step 1/3] Chromium executable: {executable}")
@@ -157,13 +119,12 @@ async def create_auth_state(
         stderr=subprocess.DEVNULL,
     )
 
-    # Poll so the TUI remains responsive
-    while proc.poll() is None:
+    while proc.poll() is None:          # poll so TUI stays responsive
         await asyncio.sleep(0.5)
 
     log_fn("[step 1/3] Chromium closed.")
 
-    # ── Step 2: Export storageState from persistent context ──────────────────
+    # ── Step 2: export storageState from persistent context ──────────────────
     log_fn("[step 2/3] Loading persistent profile into Playwright (headless)…")
 
     async with async_playwright() as p:
@@ -178,15 +139,14 @@ async def create_auth_state(
         except Exception as exc:
             log_fn(f"[step 2/3] Warning during goto: {exc}")
 
-        # Give site 2 s to hydrate session state (mirrors JS waitForTimeout(2000))
-        await asyncio.sleep(2)
+        await asyncio.sleep(2)          # hydrate session state (mirrors waitForTimeout(2000))
 
         await context.storage_state(path=str(state_file))
         await context.close()
 
     log_fn(f"[step 2/3] Storage state saved → {state_file}")
 
-    # ── Step 3: Verify with plain headless + state file ──────────────────────
+    # ── Step 3: verify with plain headless + state file ──────────────────────
     log_fn("[step 3/3] Verifying headless session with saved state…")
 
     async with async_playwright() as p:
@@ -194,7 +154,7 @@ async def create_auth_state(
             headless=True,
             args=["--disable-dev-shm-usage"],
         )
-        ctx = await browser.new_context(storage_state=str(state_file))
+        ctx  = await browser.new_context(storage_state=str(state_file))
         page = await ctx.new_page()
         try:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=30_000)
@@ -203,9 +163,7 @@ async def create_auth_state(
             log_fn(f"[step 3/3] Warning during verification: {exc}")
         await browser.close()
 
-    # Clean up profile dir (state file is returned to caller for upload)
     shutil.rmtree(profile_dir, ignore_errors=True)
-
     log_fn("Done – state file ready for upload.")
     return state_file
 
@@ -224,15 +182,15 @@ class HostAPI:
         return f"{self.base_url}{path}"
 
     async def status(self) -> dict:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(self._url("/status"))
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(self._url("/status"))
             r.raise_for_status()
             return r.json()
 
     async def upload(self, file_path: Path) -> dict:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30) as c:
             with open(file_path, "rb") as fh:
-                r = await client.post(
+                r = await c.post(
                     self._url("/upload"),
                     files={"file": (file_path.name, fh, "application/json")},
                 )
@@ -240,41 +198,45 @@ class HostAPI:
             return r.json()
 
     async def remove(self, file_id: str) -> dict:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(self._url(f"/remove/{file_id}"))
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(self._url(f"/remove/{file_id}"))
             r.raise_for_status()
             return r.json()
 
+    async def states(self) -> list[str]:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(self._url("/states"))
+            r.raise_for_status()
+            return r.json().get("states", [])
+
     async def get_log(self, kind: str) -> str:
-        """kind: 'api' or 'worker'"""
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(self._url(f"/logs/{kind}"))
-            if r.status_code == 200:
-                return r.text
-            return f"[error {r.status_code}] {r.text}"
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(self._url(f"/logs/{kind}"))
+            return r.text if r.status_code == 200 else f"[error {r.status_code}] {r.text}"
 
     async def clear_log(self, kind: str) -> dict:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.delete(self._url(f"/logs/{kind}"))
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.delete(self._url(f"/logs/{kind}"))
             r.raise_for_status()
             return r.json()
 
 
 # ---------------------------------------------------------------------------
-# Textual widgets
+# Custom widgets
 # ---------------------------------------------------------------------------
 
 class HostItem(ListItem):
     def __init__(self, name: str, url: str, index: int):
-        super().__init__(Label(f"{name}  [{url}]"))
-        self.host_name = name
-        self.host_url = url
+        super().__init__(Label(f"{name}\n{url}"))
+        self.host_name  = name
+        self.host_url   = url
         self.host_index = index
 
 
-class StatusBar(Static):
-    """One-line status strip at the bottom of the top panel."""
-    pass
+class StateItem(ListItem):
+    def __init__(self, state_id: str):
+        super().__init__(Label(state_id))
+        self.state_id = state_id
 
 
 # ---------------------------------------------------------------------------
@@ -284,13 +246,14 @@ class StatusBar(Static):
 class BeansPanel(App):
 
     CSS = """
+    /* ── Root layout ─────────────────────────────────────────── */
     Screen {
         layout: horizontal;
     }
 
-    /* ── Sidebar ── */
+    /* ── Sidebar ─────────────────────────────────────────────── */
     #sidebar {
-        width: 32;
+        width: 30;
         border-right: solid $primary-darken-2;
         layout: vertical;
         padding: 0 1;
@@ -300,6 +263,7 @@ class BeansPanel(App):
         text-style: bold;
         color: $primary;
         padding: 1 0 0 0;
+        height: 2;
     }
 
     #host-list {
@@ -329,40 +293,56 @@ class BeansPanel(App):
 
     #btn-remove-host {
         width: 1fr;
+        margin-bottom: 1;
     }
 
-    /* ── Main panel ── */
+    /* ── Main area ───────────────────────────────────────────── */
     #main {
         width: 1fr;
         layout: vertical;
     }
 
-    /* ── Active-host strip ── */
+    /* ── Active-host bar ─────────────────────────────────────── */
     #active-host-bar {
         height: 3;
         background: $primary-darken-3;
         padding: 0 2;
         layout: horizontal;
         align: left middle;
+        margin-bottom: 1;
     }
 
     #active-host-label {
+        width: 1fr;
         color: $text;
         text-style: bold;
     }
 
     #status-dot {
-        width: 14;
+        width: 16;
         color: $success;
-        margin-left: 2;
+        text-align: right;
     }
 
-    /* ── Controls row ── */
-    #controls {
-        height: 5;
+    /* ── Tabs fill remaining height ──────────────────────────── */
+    TabbedContent {
+        height: 1fr;
+    }
+
+    TabPane {
+        padding: 0;
+    }
+
+    /* ── Auth-state tab ──────────────────────────────────────── */
+    #pane-auth {
+        layout: vertical;
         padding: 1 2;
+    }
+
+    #auth-url-row {
+        height: 3;
         layout: horizontal;
-        border-bottom: solid $primary-darken-3;
+        margin-bottom: 1;
     }
 
     #target-url {
@@ -371,45 +351,36 @@ class BeansPanel(App):
     }
 
     #btn-create-state {
-        width: 22;
-        margin-right: 1;
+        width: 26;
     }
 
     #btn-check-status {
         width: 18;
+        margin-left: 1;
     }
 
-    /* ── Log area ── */
-    #log-area {
-        height: 1fr;
-        layout: vertical;
-    }
-
-    TabbedContent {
-        height: 1fr;
-    }
-
-    /* ── Activity log ── */
-    #activity-log {
-        height: 1fr;
-        border-top: solid $primary-darken-3;
-        padding: 0 1;
-        max-height: 14;
-    }
-
-    #activity-title {
+    #auth-activity-title {
+        height: 2;
         text-style: bold;
         color: $accent;
-        padding: 1 0 0 1;
-        height: 2;
+        padding: 1 0 0 0;
     }
 
-    /* Remove-state panel */
-    #remove-panel {
-        height: auto;
+    #auth-activity-log {
+        height: 1fr;
+        border: solid $primary-darken-3;
+    }
+
+    /* ── Remove-state tab ────────────────────────────────────── */
+    #pane-remove {
+        layout: vertical;
         padding: 1 2;
+    }
+
+    #remove-row {
+        height: 3;
         layout: horizontal;
-        border-bottom: solid $primary-darken-3;
+        margin-bottom: 1;
     }
 
     #remove-id-input {
@@ -421,24 +392,54 @@ class BeansPanel(App):
         width: 22;
     }
 
-    .log-actions {
-        height: 3;
+    #btn-refresh-states {
+        width: 22;
+        margin-right: 1;
+    }
+
+    #remove-hint {
+        color: $text-muted;
+        padding: 0 0 1 0;
+    }
+
+    #states-title {
+        height: 2;
+        text-style: bold;
+        color: $accent;
+        padding: 1 0 0 0;
+    }
+
+    #states-list {
+        height: 1fr;
+        border: solid $primary-darken-3;
+    }
+
+    /* ── Shared log-tab styles ───────────────────────────────── */
+    .log-pane {
+        layout: vertical;
+        height: 1fr;
+    }
+
+    .log-toolbar {
+        height: 4;
         layout: horizontal;
-        padding: 0 1;
+        padding: 0 5;
         align: left middle;
+        border-bottom: solid $primary-darken-3;
     }
 
     .btn-refresh {
-        margin-right: 1;
         width: 16;
+        margin-right: 1;
     }
 
     .btn-clear {
         width: 16;
     }
 
-    Log {
+    .remote-log {
         height: 1fr;
+        padding: 0 1;
     }
     """
 
@@ -452,7 +453,6 @@ class BeansPanel(App):
     def __init__(self):
         super().__init__()
         self._hosts: list[dict] = load_hosts()
-        self._state_creation_task: asyncio.Task | None = None
 
     # ── Composition ──────────────────────────────────────────────────────────
 
@@ -460,69 +460,90 @@ class BeansPanel(App):
         yield Header(show_clock=True)
 
         with Horizontal():
-            # Sidebar
+
+            # ── Left sidebar ─────────────────────────────────────────────────
             with Vertical(id="sidebar"):
-                yield Static("🖥 Hosts", id="sidebar-title")
+                yield Static("🖥  Hosts", id="sidebar-title")
                 yield ListView(id="host-list")
                 with Vertical(id="sidebar-controls"):
-                    yield Input(placeholder="Name", id="new-host-name")
-                    yield Input(placeholder="http://host:port", id="new-host-url")
-                    yield Button("＋ Add Host", id="btn-add-host", variant="success")
-                    yield Button("✕ Remove Host", id="btn-remove-host", variant="error")
+                    yield Input(placeholder="Name",              id="new-host-name")
+                    yield Input(placeholder="http://host:port",  id="new-host-url")
+                    yield Button("＋ Add Host",    id="btn-add-host",    variant="success")
+                    yield Button("✕ Remove Host",  id="btn-remove-host", variant="error")
 
-            # Main area
+            # ── Right main area ───────────────────────────────────────────────
             with Vertical(id="main"):
-                # Active host bar
+
+                # Active-host bar always visible at the top
                 with Horizontal(id="active-host-bar"):
                     yield Static("No host selected", id="active-host-label")
-                    yield Static("● offline", id="status-dot")
+                    yield Static("● offline",         id="status-dot")
 
-                # Controls
-                with Horizontal(id="controls"):
-                    yield Input(
-                        placeholder="https://example.com  (target URL for auth)",
-                        id="target-url",
-                    )
-                    yield Button(
-                        "🔑 Create & Upload State",
-                        id="btn-create-state",
-                        variant="success",
-                    )
-                    yield Button(
-                        "⚡ Check Status",
-                        id="btn-check-status",
-                        variant="primary",
-                    )
+                # All child panels live as tabs
+                with TabbedContent(id="main-tabs"):
 
-                # Remove-state row
-                with Horizontal(id="remove-panel"):
-                    yield Input(
-                        placeholder="Auth state UUID to remove from host",
-                        id="remove-id-input",
-                    )
-                    yield Button(
-                        "🗑 Remove State",
-                        id="btn-remove-state",
-                        variant="warning",
-                    )
+                    # ── Tab 1: Auth State ─────────────────────────────────────
+                    with TabPane("🔑 Auth State", id="tab-auth"):
+                        with Vertical(id="pane-auth"):
+                            with Horizontal(id="auth-url-row"):
+                                yield Input(
+                                    placeholder="https://example.com  (target URL for auth)",
+                                    id="target-url",
+                                )
+                                yield Button(
+                                    "🔑 Create & Upload",
+                                    id="btn-create-state",
+                                    variant="success",
+                                )
+                                yield Button(
+                                    "⚡ Status",
+                                    id="btn-check-status",
+                                    variant="primary",
+                                )
+                            yield Static("📋 Activity", id="auth-activity-title")
+                            yield Log(id="activity-log", highlight=True)
 
-                # Tabbed logs
-                with TabbedContent(id="log-tabs"):
-                    with TabPane("API Log", id="tab-api"):
-                        with Horizontal(classes="log-actions"):
-                            yield Button("↺ Refresh", id="btn-refresh-api", classes="btn-refresh")
-                            yield Button("✕ Clear", id="btn-clear-api", classes="btn-clear", variant="warning")
-                        yield Log(id="log-api", highlight=True)
+                    # ── Tab 2: Remove State ───────────────────────────────────
+                    with TabPane("🗑  Remove State", id="tab-remove"):
+                        with Vertical(id="pane-remove"):
+                            yield Static(
+                                "Enter the UUID returned by /upload — or pick one from the list below — "
+                                "to delete that auth state from the host.",
+                                id="remove-hint",
+                            )
+                            with Horizontal(id="remove-row"):
+                                yield Input(
+                                    placeholder="Auth state UUID",
+                                    id="remove-id-input",
+                                )
+                                yield Button(
+                                    "🗑  Remove State",
+                                    id="btn-remove-state",
+                                    variant="warning",
+                                )
+                            yield Static("🗂  States on host", id="states-title")
+                            yield Button(
+                                "↺ Refresh States",
+                                id="btn-refresh-states",
+                                variant="primary",
+                            )
+                            yield ListView(id="states-list")
 
-                    with TabPane("Worker Log", id="tab-worker"):
-                        with Horizontal(classes="log-actions"):
-                            yield Button("↺ Refresh", id="btn-refresh-worker", classes="btn-refresh")
-                            yield Button("✕ Clear", id="btn-clear-worker", classes="btn-clear", variant="warning")
-                        yield Log(id="log-worker", highlight=True)
+                    # ── Tab 3: API Log ────────────────────────────────────────
+                    with TabPane("📄 API Log", id="tab-api"):
+                        with Vertical(classes="log-pane"):
+                            with Horizontal(classes="log-toolbar"):
+                                yield Button("↺ Refresh", id="btn-refresh-api",  classes="btn-refresh")
+                                yield Button("✕ Clear",   id="btn-clear-api",    classes="btn-clear", variant="warning")
+                            yield Log(id="log-api", highlight=True, classes="remote-log")
 
-                # Activity / local log
-                yield Static("📋 Activity", id="activity-title")
-                yield Log(id="activity-log", highlight=True)
+                    # ── Tab 4: Worker Log ─────────────────────────────────────
+                    with TabPane("⚙  Worker Log", id="tab-worker"):
+                        with Vertical(classes="log-pane"):
+                            with Horizontal(classes="log-toolbar"):
+                                yield Button("↺ Refresh", id="btn-refresh-worker", classes="btn-refresh")
+                                yield Button("✕ Clear",   id="btn-clear-worker",   classes="btn-clear", variant="warning")
+                            yield Log(id="log-worker", highlight=True, classes="remote-log")
 
         yield Footer()
 
@@ -551,6 +572,7 @@ class BeansPanel(App):
         self.query_one("#status-dot", Static).update("● …")
         self._activity(f"Switched to host: {host['name']} ({host['url']})")
         self.check_host_status()
+        self.fetch_states()
 
     def _active_api(self) -> HostAPI | None:
         if self.active_host_index < 0:
@@ -568,43 +590,37 @@ class BeansPanel(App):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if isinstance(event.item, HostItem):
             self._select_host(event.item.host_index)
+        elif isinstance(event.item, StateItem):
+            self.query_one("#remove-id-input", Input).value = event.item.state_id
 
     def on_button_pressed(self, event: Button.Pressed) -> None:  # noqa: PLR0912
         bid = event.button.id
 
-        # ── Sidebar ──
-        if bid == "btn-add-host":
-            self._add_host()
-        elif bid == "btn-remove-host":
-            self._remove_selected_host()
+        # Sidebar
+        if   bid == "btn-add-host":       self._add_host()
+        elif bid == "btn-remove-host":    self._remove_selected_host()
 
-        # ── Controls ──
-        elif bid == "btn-create-state":
-            self._start_create_state()
-        elif bid == "btn-check-status":
-            self.check_host_status()
+        # Auth State tab
+        elif bid == "btn-create-state":   self._start_create_state()
+        elif bid == "btn-check-status":   self.check_host_status()
 
-        # ── Remove state ──
-        elif bid == "btn-remove-state":
-            self._remove_state()
+        # Remove State tab
+        elif bid == "btn-remove-state":   self._remove_state()
+        elif bid == "btn-refresh-states": self.fetch_states()
 
-        # ── API log ──
-        elif bid == "btn-refresh-api":
-            self.fetch_log("api")
-        elif bid == "btn-clear-api":
-            self.clear_log("api")
+        # API Log tab
+        elif bid == "btn-refresh-api":    self.fetch_log("api")
+        elif bid == "btn-clear-api":      self.clear_log("api")
 
-        # ── Worker log ──
-        elif bid == "btn-refresh-worker":
-            self.fetch_log("worker")
-        elif bid == "btn-clear-worker":
-            self.clear_log("worker")
+        # Worker Log tab
+        elif bid == "btn-refresh-worker": self.fetch_log("worker")
+        elif bid == "btn-clear-worker":   self.clear_log("worker")
 
     # ── Host management ───────────────────────────────────────────────────────
 
     def _add_host(self) -> None:
         name = self.query_one("#new-host-name", Input).value.strip()
-        url = self.query_one("#new-host-url", Input).value.strip()
+        url  = self.query_one("#new-host-url",  Input).value.strip()
         if not name or not url:
             self._activity("Error: provide both name and URL to add a host.")
             return
@@ -612,7 +628,7 @@ class BeansPanel(App):
         save_hosts(self._hosts)
         self._rebuild_host_list()
         self.query_one("#new-host-name", Input).clear()
-        self.query_one("#new-host-url", Input).clear()
+        self.query_one("#new-host-url",  Input).clear()
         self._activity(f"Host added: {name} ({url})")
         self._select_host(len(self._hosts) - 1)
 
@@ -629,8 +645,7 @@ class BeansPanel(App):
         self._rebuild_host_list()
         self._activity(f"Host removed: {removed['name']}")
         if self._hosts:
-            new_idx = min(item.host_index, len(self._hosts) - 1)
-            self._select_host(new_idx)
+            self._select_host(min(item.host_index, len(self._hosts) - 1))
         else:
             self.active_host_index = -1
             self.query_one("#active-host-label", Static).update("No host selected")
@@ -650,7 +665,6 @@ class BeansPanel(App):
             data = await api.status()
             if data.get("status") == "ok":
                 dot.update("● online")
-                dot.remove_class("offline")
                 self._activity(f"Status OK – {api.base_url}")
             else:
                 dot.update("● unknown")
@@ -679,9 +693,7 @@ class BeansPanel(App):
         state_file: Path | None = None
         try:
             self._activity(f"Starting auth-state creation for {target_url}")
-
             state_file = await create_auth_state(target_url, self._activity)
-
             self._activity("Uploading state file to host…")
             result = await api.upload(state_file)
             self._activity(
@@ -710,8 +722,26 @@ class BeansPanel(App):
             result = await api.remove(file_id)
             self._activity(f"Removed state: {result.get('id', file_id)}")
             self.query_one("#remove-id-input", Input).clear()
+            self.fetch_states()
         except Exception as exc:
             self._activity(f"❌ Remove failed: {exc}")
+
+    @work(exclusive=False, thread=False)
+    async def fetch_states(self) -> None:
+        api = self._active_api()
+        if api is None:
+            self._activity("No host selected.")
+            return
+        self._activity("Fetching states from host…")
+        try:
+            states = await api.states()
+            lv = self.query_one("#states-list", ListView)
+            lv.clear()
+            for state_id in states:
+                lv.append(StateItem(state_id))
+            self._activity(f"States refreshed ({len(states)} on host).")
+        except Exception as exc:
+            self._activity(f"❌ Failed to fetch states: {exc}")
 
     # ── Log actions ───────────────────────────────────────────────────────────
 
